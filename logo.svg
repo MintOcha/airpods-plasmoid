@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3daee9"/>
+      <stop offset="1" stop-color="#1d6fb8"/>
+    </linearGradient>
+    <linearGradient id="pod" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e3eaf2"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#0b3556" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+
+  <g filter="url(#shadow)">
+    <!-- left pod: head + stem -->
+    <circle cx="186" cy="200" r="62" fill="url(#pod)"/>
+    <rect x="200" y="200" width="40" height="190" rx="20" fill="url(#pod)"/>
+    <ellipse cx="168" cy="196" rx="22" ry="26" fill="#1d6fb8" opacity="0.18"/>
+
+    <!-- right pod, mirrored -->
+    <circle cx="326" cy="200" r="62" fill="url(#pod)"/>
+    <rect x="272" y="200" width="40" height="190" rx="20" fill="url(#pod)"/>
+    <ellipse cx="344" cy="196" rx="22" ry="26" fill="#1d6fb8" opacity="0.18"/>
+  </g>
+
+  <!-- stem tips -->
+  <rect x="204" y="364" width="32" height="18" rx="9" fill="#c9d3de"/>
+  <rect x="276" y="364" width="32" height="18" rx="9" fill="#c9d3de"/>
+</svg>
