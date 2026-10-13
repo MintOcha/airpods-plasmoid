@@ -1,49 +1,50 @@
-"""Spatial audio: a high-fidelity PipeWire filter-chain delivering Dolby Atmos-level 7.1
-binaural virtualization through dry Atmos HRIR impulse responses and AirPods Pro acoustic calibration EQ,
-smoothly steered by AirPods head tracking with zero audio pausing, zero mud, and exact 1:1 volume calibration.
+"""Spatial audio: a PipeWire filter-chain that renders every channel as a virtual speaker through a dense
+measured HRTF set, steered by AirPods head tracking.
+
+Head tracking re-renders the virtual speakers with two filter banks: the idle bank is moved to the new head pose,
+given time to settle, then crossfaded in. Neither bank's filters ever change while audible, and the crossfade
+weight is one control smoothed at audio rate, so no update can step or tear.
 """
 
 import json
 import math
 import os
 import subprocess
+import sys
 import time
 from gi.repository import GLib
 
-HRTF = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hrir', 'atmos.wav')
-EQ_CONF = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hrir', 'airpods_eq.txt')
+ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'binaural')
+HRTF = os.path.join(ASSETS, 'hrtf.sofa')
+ROOM = os.path.join(ASSETS, 'room.wav')   # per speaker: late field at the left ear, then the right ear
 SINK_NAME = 'airpods_spatial'
 
-# Circularly sorted virtual 7.1 speaker layout (azimuth counter-clockwise in degrees)
+# Virtual speaker layout (ITU-R BS.775 7.1): (channel, azimuth counter-clockwise from front, elevation) in degrees
 SPEAKERS = [
-    ('FC', 0.0),
-    ('FL', 30.0),
-    ('SL', 90.0),
-    ('RL', 150.0),
-    ('RR', 210.0),
-    ('SR', 270.0),
-    ('FR', 330.0),
+    ('FL', 30.0, 0.0),
+    ('FR', -30.0, 0.0),
+    ('FC', 0.0, 0.0),
+    ('SL', 90.0, 0.0),
+    ('SR', -90.0, 0.0),
+    ('RL', 150.0, 0.0),
+    ('RR', -150.0, 0.0),
 ]
-SPEAKER_NAMES = [name for name, _ in SPEAKERS]
-CH_INDEX = {name: i + 1 for i, name in enumerate(SPEAKER_NAMES)}
+CHANNELS = ['FL', 'FR', 'FC', 'LFE', 'RL', 'RR', 'SL', 'SR']
+LFE_GAIN = 0.5
+OUTPUT_GAIN = 0.37    # full-scale bass-heavy mixes stay below 0 dBFS (no limiter in the chain)
+BANKS = ('A', 'B')
 
-# HeSuVi 14-channel Dolby Atmos HRIR channel assignments:
-# FL: (0, 1), SL: (2, 3), RL: (4, 5), FC: (6, 13), FR: (8, 7), SR: (10, 9), RR: (12, 11), LFE: (6, 13)
-HESUVI_MAP = {
-    'FL': (0, 1),
-    'SL': (2, 3),
-    'RL': (4, 5),
-    'FC': (6, 13),
-    'FR': (8, 7),
-    'SR': (10, 9),
-    'RR': (12, 11),
-    'LFE': (6, 13),
-}
+# Rendering cadence. The engine runs at a fixed rate and requests a small processing block so the idle bank's
+# convolvers have refilled their history (one block after a move) well within the settle time.
+RATE = 48000
+QUANTUM = 512
+SETTLE_SECONDS = 2 * QUANTUM / RATE
+FADE_SECONDS = 0.03                    # crossfade weight is within -80 dB of its target after this long
+FADE_POLE = math.exp(-12.0 / (FADE_SECONDS * RATE))
 
-# Head tracking and recentering constants
+# Head tracking constants
 RECENTER_SECONDS = 12.0
-UPDATE_INTERVAL = 0.02   # 50 Hz update cadence
-UPDATE_THRESHOLD = 0.2   # 0.2 degree steering deadband for jitter-free stability
+UPDATE_THRESHOLD = 0.5   # degrees of head motion worth re-rendering
 ATTACH_ATTEMPTS = 40
 STREAM_GAP_SECONDS = 0.5
 SMOOTH_FACTOR = 0.35     # 1st-order low-pass filter factor
@@ -51,50 +52,57 @@ SMOOTH_FACTOR = 0.35     # 1st-order low-pass filter factor
 
 def _graph():
     nodes, links = [], []
-
-    # 1. Input copy nodes for 7.1 channels
-    for ch in SPEAKER_NAMES:
+    for ch, azimuth, elevation in SPEAKERS:
         nodes.append(f'{{ type = builtin label = copy name = in{ch} }}')
+        for bank in BANKS:
+            nodes.append(f'{{ type = sofa label = spatializer name = spk{ch}{bank} config = {{ filename = "{HRTF}" }} '
+                         f'control = {{ "Azimuth" = {azimuth % 360.0} "Elevation" = {elevation} }} }}')
+            links.append(f'{{ output = "in{ch}:Out" input = "spk{ch}{bank}:In" }}')
     nodes.append('{ type = builtin label = copy name = inLFE }')
 
-    # 2. Dynamic VBAP steering mixers for directional speakers
-    for ch in SPEAKER_NAMES:
-        ctrls = ' '.join(f'"Gain {i}" = {"1.0" if src == ch else "0.0"}' for i, src in enumerate(SPEAKER_NAMES, 1))
-        nodes.append(f'{{ type = builtin label = mixer name = steer{ch} control = {{ {ctrls} }} }}')
-        for i, src in enumerate(SPEAKER_NAMES, 1):
-            links.append(f'{{ output = "in{src}:Out" input = "steer{ch}:In {i}" }}')
+    # The virtual room stays fixed to the head: its late field is diffuse, so it does not need steering
+    for i, (ch, _, _) in enumerate(SPEAKERS):
+        for side, offset in (('L', 0), ('R', 1)):
+            nodes.append(f'{{ type = builtin label = convolver name = room{ch}{side} '
+                         f'config = {{ filename = "{ROOM}" channel = {2 * i + offset} }} }}')
+            links.append(f'{{ output = "in{ch}:Out" input = "room{ch}{side}:In" }}')
 
-    # 3. 14-channel dry Dolby Atmos convolvers (authentic HRIRs with preserved ITD/ILD, 0 ms reverb tail)
-    for ch in SPEAKER_NAMES:
-        l_ch, r_ch = HESUVI_MAP[ch]
-        nodes.append(f'{{ type = builtin label = convolver name = conv{ch}_L config = {{ filename = "{HRTF}" channel = {l_ch} }} }}')
-        nodes.append(f'{{ type = builtin label = convolver name = conv{ch}_R config = {{ filename = "{HRTF}" channel = {r_ch} }} }}')
-        links.append(f'{{ output = "steer{ch}:Out" input = "conv{ch}_L:In" }}')
-        links.append(f'{{ output = "steer{ch}:Out" input = "conv{ch}_R:In" }}')
+    # Crossfade weight of bank B: a constant set by one control, smoothed by a critically damped two-pole
+    # low-pass (monotonic S-curve, no overshoot). Bank A gets the complement.
+    nodes.append('{ type = builtin label = sine name = fade control = { "Freq" = 0.0 "Ampl" = 0.0 "Offset" = 0.0 } }')
+    # bq_raw takes its coefficients from config; the matching controls keep port defaults from replacing them
+    poles = {'b0': (1 - FADE_POLE) ** 2, 'b1': 0.0, 'b2': 0.0, 'a0': 1.0, 'a1': -2 * FADE_POLE, 'a2': FADE_POLE ** 2}
+    coefficients = ' '.join(f'{k} = {v!r}' for k, v in poles.items())
+    controls = ' '.join(f'"{k}" = {v!r}' for k, v in poles.items())
+    nodes.append(f'{{ type = builtin label = bq_raw name = weightB config = {{ coefficients = [ '
+                 f'{{ rate = {RATE} {coefficients} }} ] }} control = {{ {controls} }} }}')
+    nodes.append('{ type = builtin label = linear name = weightA control = { "Mult" = -1.0 "Add" = 1.0 } }')
+    links.append('{ output = "fade:Out" input = "weightB:In" }')
+    links.append('{ output = "weightB:Out" input = "weightA:In" }')
 
-    # LFE convolver (routed to center HRIR)
-    nodes.append(f'{{ type = builtin label = convolver name = convLFE_L config = {{ filename = "{HRTF}" channel = 6 }} }}')
-    nodes.append(f'{{ type = builtin label = convolver name = convLFE_R config = {{ filename = "{HRTF}" channel = 13 }} }}')
-    links.append('{ output = "inLFE:Out" input = "convLFE_L:In" }')
-    links.append('{ output = "inLFE:Out" input = "convLFE_R:In" }')
+    gains = ' '.join(f'"Gain {i}" = {OUTPUT_GAIN}' for i in range(1, len(SPEAKERS) + 1))
+    for side, port in (('L', 'Out L'), ('R', 'Out R')):
+        for bank in BANKS:
+            nodes.append(f'{{ type = builtin label = mixer name = sum{side}{bank} control = {{ {gains} }} }}')
+            for i, (ch, _, _) in enumerate(SPEAKERS, 1):
+                links.append(f'{{ output = "spk{ch}{bank}:{port}" input = "sum{side}{bank}:In {i}" }}')
+            nodes.append(f'{{ type = builtin label = mult name = faded{side}{bank} }}')
+            links.append(f'{{ output = "sum{side}{bank}:Out" input = "faded{side}{bank}:In 1" }}')
+            links.append(f'{{ output = "weight{bank}:Out" input = "faded{side}{bank}:In 2" }}')
+        nodes.append(f'{{ type = builtin label = mixer name = room{side} control = {{ {gains} }} }}')
+        for i, (ch, _, _) in enumerate(SPEAKERS, 1):
+            links.append(f'{{ output = "room{ch}{side}:Out" input = "room{side}:In {i}" }}')
+        nodes.append(f'{{ type = builtin label = mixer name = out{side} control = {{ "Gain 1" = 1.0 "Gain 2" = 1.0 '
+                     f'"Gain 3" = {OUTPUT_GAIN * LFE_GAIN} "Gain 4" = 1.0 }} }}')
+        links.append(f'{{ output = "faded{side}A:Out" input = "out{side}:In 1" }}')
+        links.append(f'{{ output = "faded{side}B:Out" input = "out{side}:In 2" }}')
+        links.append(f'{{ output = "inLFE:Out" input = "out{side}:In 3" }}')
+        links.append(f'{{ output = "room{side}:Out" input = "out{side}:In 4" }}')
 
-    # 4. Master output stereo mixers (calibrated gain for clean, unclipped 1:1 loudness match)
-    out_ctrls = ' '.join(f'"Gain {i}" = 0.95' for i in range(1, len(SPEAKER_NAMES) + 2))
-    nodes.append(f'{{ type = builtin label = mixer name = outMixL control = {{ {out_ctrls} }} }}')
-    nodes.append(f'{{ type = builtin label = mixer name = outMixR control = {{ {out_ctrls} }} }}')
-
-    for i, ch in enumerate(SPEAKER_NAMES + ['LFE'], 1):
-        links.append(f'{{ output = "conv{ch}_L:Out" input = "outMixL:In {i}" }}')
-        links.append(f'{{ output = "conv{ch}_R:Out" input = "outMixR:In {i}" }}')
-
-    # 5. AirPods Pro 2 acoustic calibration parametric equalizer
-    nodes.append(f'{{ type = builtin label = param_eq name = airpods_eq config = {{ filename = "{EQ_CONF}" }} }}')
-    links.append('{ output = "outMixL:Out" input = "airpods_eq:In 1" }')
-    links.append('{ output = "outMixR:Out" input = "airpods_eq:In 2" }')
-
-    inputs = ' '.join(f'"in{ch}:In"' for ch in ['FL', 'FR', 'FC', 'LFE', 'RL', 'RR', 'SL', 'SR'])
+    port_of = {ch: f'"in{ch}:In"' for ch in CHANNELS}
+    inputs = ' '.join(port_of[ch] for ch in CHANNELS)
     return ('nodes = [\n' + '\n'.join(nodes) + '\n]\nlinks = [\n' + '\n'.join(links) +
-            f'\n]\ninputs = [ {inputs} ]\noutputs = [ "airpods_eq:Out 1" "airpods_eq:Out 2" ]')
+            f'\n]\ninputs = [ {inputs} ]\noutputs = [ "outL:Out" "outR:Out" ]')
 
 
 CONF = """context.properties = {{ log.level = 0 }}
@@ -110,20 +118,18 @@ context.modules = [
     {{ name = libpipewire-module-filter-chain
         args = {{
             node.description = "{description}"
+            node.latency = "{quantum}/{rate}"
+            audio.rate = {rate}
             filter.graph = {{
 {graph}
             }}
             capture.props = {{
                 node.name = "{sink}"
                 media.class = Audio/Sink
-                audio.channels = 8
-                audio.position = [ FL FR FC LFE RL RR SL SR ]
+                audio.channels = {channels}
+                audio.position = [ {positions} ]
                 channelmix.normalize = false
-                channelmix.upmix = true
-                channelmix.upmix-method = psd
-                channelmix.lfe-cutoff = 120
-                channelmix.fc-cutoff = 8000
-                channelmix.rear-delay = 0.0
+                channelmix.upmix = false
             }}
             playback.props = {{
                 node.name = "{sink}.output"
@@ -139,33 +145,13 @@ context.modules = [
 """
 
 
-def _pan_source(angle):
-    """Vector-Base Amplitude Panning: equal-power gain pair for adjacent speakers."""
-    angle = angle % 360.0
-    n = len(SPEAKERS)
-    for i in range(n):
-        name_a, az_a = SPEAKERS[i]
-        name_b, az_b = SPEAKERS[(i + 1) % n]
-        span = (az_b - az_a) % 360.0
-        diff = (angle - az_a) % 360.0
-        if diff <= span:
-            t = diff / span if span > 0 else 0.0
-            g_a = math.cos(t * math.pi / 2)
-            g_b = math.sin(t * math.pi / 2)
-            return {name_a: g_a, name_b: g_b}
-    return {SPEAKERS[0][0]: 1.0}
-
-
-def compute_matrix(yaw):
-    """Compute 7x7 steering gain matrix for a head yaw angle."""
-    matrix = {}
-    for in_name, in_az in SPEAKERS:
-        in_idx = CH_INDEX[in_name]
-        apparent_az = (in_az - yaw) % 360.0
-        gains = _pan_source(apparent_az)
-        for spk, g in gains.items():
-            matrix[(spk, in_idx)] = g
-    return matrix
+def source_direction(azimuth, elevation, yaw, pitch):
+    """Direction (azimuth, elevation) of a world-fixed source as heard by a head turned by yaw/pitch."""
+    az, el, yw, pt = map(math.radians, (azimuth, elevation, yaw, pitch))
+    x, y, z = math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el)
+    x, y = x * math.cos(yw) + y * math.sin(yw), y * math.cos(yw) - x * math.sin(yw)
+    x, z = x * math.cos(pt) + z * math.sin(pt), z * math.cos(pt) - x * math.sin(pt)
+    return math.degrees(math.atan2(y, x)) % 360.0, math.degrees(math.asin(max(-1.0, min(1.0, z))))
 
 
 def _run(*cmd):
@@ -181,7 +167,6 @@ def airpods_sink(address):
         if sink.get('properties', {}).get('api.bluez5.address') == address:
             return sink['name']
     return None
-
 
 
 def _mul(a, b):
@@ -256,8 +241,9 @@ class HeadPose:
         else:
             self.still_time = 0.0
 
-        # Silky smooth exponential low-pass filter
-        self.smooth_yaw += SMOOTH_FACTOR * (yaw - self.smooth_yaw)
+        # Exponential low-pass on the wrapped difference, so turning past +-180 degrees does not swing round
+        self.smooth_yaw += SMOOTH_FACTOR * ((yaw - self.smooth_yaw + 180.0) % 360.0 - 180.0)
+        self.smooth_yaw = (self.smooth_yaw + 180.0) % 360.0 - 180.0
         self.smooth_pitch += SMOOTH_FACTOR * (pitch - self.smooth_pitch)
         return self.smooth_yaw, self.smooth_pitch
 
@@ -269,10 +255,14 @@ class Spatializer:
         self.control = None
         self.node_id = None
         self.target = None
-        self.sent = (0.0, 0.0)
-        self.sent_at = 0.0
         self.attempts = 0
-        self.current_gains = {}
+        self.reset_steering()
+
+    def reset_steering(self):
+        self.bank = 'A'
+        self.rendered = (0.0, 0.0)
+        self.pending = None
+        self.switching = None
 
     @property
     def active(self):
@@ -285,7 +275,8 @@ class Spatializer:
         self.target = target
         path = os.path.join(GLib.get_user_runtime_dir(), 'airpods-spatial.conf')
         with open(path, 'w') as f:
-            f.write(CONF.format(description=description, graph=_graph(), sink=SINK_NAME, target=target))
+            f.write(CONF.format(description=description, graph=_graph(), sink=SINK_NAME, target=target,
+                                channels=len(CHANNELS), positions=' '.join(CHANNELS), quantum=QUANTUM, rate=RATE))
         self.engine = subprocess.Popen(['pipewire', '-c', path],
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.attempts = 0
@@ -302,10 +293,11 @@ class Spatializer:
                 self.control = subprocess.Popen(['pw-cli'], stdin=subprocess.PIPE, text=True,
                                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 _run('pactl', 'set-default-sink', SINK_NAME)
-                self.center()
                 self.on_change()
                 return False
         if self.attempts >= ATTACH_ATTEMPTS or self.engine.poll() is not None:
+            print('spatial audio engine did not start (needs PipeWire with the SOFA filter plugin, libmysofa)',
+                  file=sys.stderr)
             self.stop()
             return False
         return True
@@ -319,42 +311,54 @@ class Spatializer:
             if proc:
                 proc.kill()
                 proc.wait()
+        if self.switching:
+            GLib.source_remove(self.switching)
         self.engine = self.control = self.node_id = self.target = None
-        self.current_gains.clear()
+        self.reset_steering()
         if was_active:
             self.on_change()
 
-    def steer(self, yaw, pitch, force=False):
-        now = time.monotonic()
+    def steer(self, yaw, pitch):
+        """Render the virtual speakers for a head pose; poses arriving mid-switch coalesce into the next switch."""
         if not self.control:
             return
-        if not force and (now - self.sent_at < UPDATE_INTERVAL or
-                          max(abs(yaw - self.sent[0]), abs(pitch - self.sent[1])) < UPDATE_THRESHOLD):
+        if self.switching:
+            self.pending = (yaw, pitch)
             return
-        self.sent, self.sent_at = (yaw, pitch), now
+        turned = abs((yaw - self.rendered[0] + 180.0) % 360.0 - 180.0)
+        if max(turned, abs(pitch - self.rendered[1])) < UPDATE_THRESHOLD:
+            return
+        idle = 'B' if self.bank == 'A' else 'A'
+        directions = []
+        for ch, azimuth, elevation in SPEAKERS:
+            az, el = source_direction(azimuth, elevation, yaw, pitch)
+            directions.append(f'"spk{ch}{idle}:Azimuth" {az:.2f} "spk{ch}{idle}:Elevation" {el:.2f}')
+        if not self._set(directions):
+            return
+        self.bank, self.rendered = idle, (yaw, pitch)
+        self.switching = GLib.timeout_add(math.ceil(SETTLE_SECONDS * 1000), self._fade)
 
-        matrix = compute_matrix(yaw)
-        params = []
-        for (spk, in_idx), gain in matrix.items():
-            key = (spk, in_idx)
-            if force or abs(self.current_gains.get(key, 0.0) - gain) > 0.005:
-                params.append(f'"steer{spk}:Gain {in_idx}" {gain:.3f}')
-                self.current_gains[key] = gain
+    def _fade(self):
+        self.switching = None
+        if self._set([f'"fade:Offset" {1.0 if self.bank == "B" else 0.0}']):
+            self.switching = GLib.timeout_add(math.ceil(FADE_SECONDS * 1000), self._switched)
+        return False
 
-        # Zero out inactive speaker matrix crosspoints
-        for spk in SPEAKER_NAMES:
-            for in_idx in range(1, len(SPEAKER_NAMES) + 1):
-                key = (spk, in_idx)
-                if key not in matrix and self.current_gains.get(key, 0.0) > 0.001:
-                    params.append(f'"steer{spk}:Gain {in_idx}" 0.0')
-                    self.current_gains[key] = 0.0
+    def _set(self, params):
+        try:
+            self.control.stdin.write(f's {self.node_id} Props {{ params = [ {" ".join(params)} ] }}\n')
+            self.control.stdin.flush()
+            return True
+        except OSError:
+            self.stop()
+            return False
 
-        if params:
-            try:
-                self.control.stdin.write(f's {self.node_id} Props {{ params = [ {" ".join(params)} ] }}\n')
-                self.control.stdin.flush()
-            except OSError:
-                self.stop()
+    def _switched(self):
+        self.switching = None
+        if self.pending:
+            pose, self.pending = self.pending, None
+            self.steer(*pose)
+        return False
 
     def center(self):
-        self.steer(0.0, 0.0, force=True)
+        self.steer(0.0, 0.0)

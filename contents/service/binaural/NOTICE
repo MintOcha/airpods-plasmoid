@@ -1,0 +1,6 @@
+hrtf.sofa: derived from the TH Koeln Neumann KU100 HRIR measurements (Benjamin Bernschuetz,
+https://zenodo.org/records/3928297), licensed CC BY-SA 3.0; this derived file is distributed under the same
+license. Changes: subset of the 2-degree Gauss grid, minimum phase with a frequency-dependent interaural
+delay, magnitudes matched to measurements of Apple's generic Spatial Audio rendering.
+
+room.wav: synthesized by tools/build_binaural.py.

@@ -12,14 +12,15 @@ A Plasma 6 plasmoid for AirPods: exact battery, listening modes, and the setting
 - **AirPods settings** - Adaptive Audio level, Conversation Awareness, Personalized Volume, press speed/duration, swipe volume, ear detection, microphone, and more. Only settings your model reports are shown
 - **Ear detection** - pauses media when an AirPod is removed, resumes when it is put back
 - **Conversation Awareness** - lowers volume while you speak
-- **Spatial Audio** - virtual 7.1 HRTF rendering, fixed or head tracked
+- **Spatial Audio** - virtual 7.1 speakers in a small virtual room, matched to Apple's generic Spatial Audio rendering; fixed or head tracked
 - **Any AirPods** - detected from their Bluetooth service, not a fixed address
 
 ## Requirements
 
 - Plasma 6, PipeWire, BlueZ
 - `python-dbus`, `python-gobject`, `python-cryptography`
-- `libmysofa` (Spatial Audio)
+- PipeWire's SOFA filter plugin for Spatial Audio: included with `pipewire-audio` on Arch;
+  `pipewire-module-filter-chain-sofa` on Fedora; `libspa-0.2-modules-extra` on Ubuntu
 
 ## Installation
 
@@ -45,3 +46,4 @@ MIT
 
 - AirPods protocol documentation: [LibrePods](https://github.com/librepods-org/librepods) reverse-engineering notes (no LibrePods code is included)
 - Icon: [MingCute](https://github.com/Richard9394/MingCute) (Apache-2.0)
+- Spatial Audio HRTF: derived from the [TH Köln Neumann KU100 measurements](https://zenodo.org/records/3928297) (CC BY-SA 3.0, see `contents/service/binaural/NOTICE`)
