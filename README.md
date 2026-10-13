@@ -1,5 +1,8 @@
 # AirPods
 
+<img width="512" height="512" alt="logo" src="https://github.com/user-attachments/assets/c36b15b9-ea96-4a01-a830-09e471bd6446" />
+
+
 A Plasma 6 plasmoid for AirPods: exact battery, listening modes, and the settings Apple devices expose.
 
 ## Features
