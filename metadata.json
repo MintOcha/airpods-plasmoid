@@ -1,0 +1,20 @@
+{
+    "KPlugin": {
+        "Id": "com.mintocha.airpods",
+        "Name": "AirPods",
+        "Description": "Battery, listening modes and settings for AirPods",
+        "Icon": "audio-headphones",
+        "Version": "0.1.0",
+        "Authors": [
+            {
+                "Name": "MintOcha"
+            }
+        ],
+        "Category": "Multimedia",
+        "License": "MIT",
+        "EnabledByDefault": true
+    },
+    "KPackageStructure": "Plasma/Applet",
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-MainScript": "ui/main.qml"
+}
