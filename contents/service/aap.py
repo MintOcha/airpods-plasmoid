@@ -88,10 +88,9 @@ def _battery(body):
 def _orientation(packet):
     """Vector part (x, y, z) of the head rotation quaternion, sent as Q15 integers.
 
-    The pods omit w, so its sign is ambiguous; spatial.HeadPose resolves it from
-    continuity. Blank samples (sent while the sensors start up) return None.
+    Blank samples (sent while the sensors start up) return None.
     """
-    vector = tuple(v / 32768 for v in struct.unpack_from('<3h', packet, 43))
+    vector = tuple(v / 32768.0 for v in struct.unpack_from('<3h', packet, 43))
     return vector if any(vector) else None
 
 
