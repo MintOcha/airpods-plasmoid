@@ -8,7 +8,7 @@ docker build -t airpods-spatial-lab tools/lab
 docker run -d --init --name airpods-lab --cap-add SYS_NICE --ulimit rtprio=95 --ulimit memlock=-1 \
     -v "$PWD":/repo -v /path/to/apple-captures:/apple:ro airpods-spatial-lab
 docker exec airpods-lab python3 measure.py        # clipping, noise floor, head-tracking grain
-docker exec airpods-lab python3 loudness.py       # loudness vs direct playback, headroom
+docker exec airpods-lab python3 loudness.py       # loudness vs direct playback, headroom (--tracked: head-tracked renderer)
 docker exec airpods-lab python3 match_apple.py /apple/dry.wav /apple/brir.wav   # error vs Apple's rendering
 ```
 
@@ -18,4 +18,6 @@ that still contain dropped blocks are re-taken, never measured.
 
 `match_apple.py` and `tools/apple_reference.py` need the community captures of Apple's renderer from the
 HeSuVi forum ("Apple Spatial Audio" thread: `AppleSpatialAudioHRIRv1` dry set, `AppleSpatialAudio+` BRIR set).
-They are not redistributed here; only measurements derived from them are (`tools/spatial_targets.json`).
+`brir.wav` (fixed mode) is the community capture itself, trimmed, so it ships Apple's rendering as captured; the
+other assets only carry measurements derived from it (`tools/spatial_targets.json`). See the licensing note in
+`contents/service/binaural/NOTICE` before publishing a package.

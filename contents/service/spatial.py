@@ -17,6 +17,7 @@ from gi.repository import GLib
 ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'binaural')
 HRTF = os.path.join(ASSETS, 'hrtf.sofa')
 ROOM = os.path.join(ASSETS, 'room.wav')   # per speaker: late field at the left ear, then the right ear
+BRIR = os.path.join(ASSETS, 'brir.wav')   # Apple's captured virtual-speaker rendering: left-ear then right-ear per speaker
 SINK_NAME = 'airpods_spatial'
 
 # Virtual speaker layout (ITU-R BS.775 7.1): (channel, azimuth counter-clockwise from front, elevation) in degrees
@@ -31,7 +32,12 @@ SPEAKERS = [
 ]
 CHANNELS = ['FL', 'FR', 'FC', 'LFE', 'RL', 'RR', 'SL', 'SR']
 LFE_GAIN = 0.5
-OUTPUT_GAIN = 0.37    # full-scale bass-heavy mixes stay below 0 dBFS (no limiter in the chain)
+OUTPUT_GAIN = 0.53    # head-tracked renderer: same level as the fixed renderer
+FIXED_GAIN = 1.08     # fixed renderer: Apple's capture plus 0.7 dB so that no program is quieter than direct playback
+LIMITER_WINDOW_SECONDS = 0.01   # peak hold, gain settling time and the latency the limiter adds
+LIMITER_TAPS = 24
+LIMITER_CEILING = 0.93
+LIMITER_SETTLE_FACTOR = 6.64   # a critically damped low-pass is within 1% of a step after 6.64 / (2 pi f0) seconds
 BANKS = ('A', 'B')
 
 # Rendering cadence. The engine runs at a fixed rate and requests a small processing block so the idle bank's
@@ -44,16 +50,16 @@ FADE_POLE = math.exp(-12.0 / (FADE_SECONDS * RATE))
 
 # Head tracking constants
 RECENTER_SECONDS = 12.0
-UPDATE_THRESHOLD = 1.0   # degrees of head motion worth re-rendering
-SWITCH_COOLDOWN_SECONDS = 0.08
+UPDATE_THRESHOLD = 1.0   # degrees of head motion worth re-rendering: above sensor jitter, below what is audible
 ATTACH_ATTEMPTS = 40
 STREAM_GAP_SECONDS = 0.5
-FILTER_MIN_CUTOFF_HZ = 0.8     # smoothing cutoff while the head is still
-FILTER_SPEED_GAIN = 0.03       # extra cutoff Hz per degree/second of head speed
-FILTER_SPEED_CUTOFF_HZ = 1.0   # smoothing of the speed estimate itself
+# One-euro filter: heavy smoothing while the head is still (kills sensor jitter), little lag while it turns
+FILTER_MIN_CUTOFF_HZ = 0.6
+FILTER_SPEED_GAIN = 0.05     # cutoff increase per degree/second of head speed
+FILTER_SPEED_CUTOFF_HZ = 1.0
 
 
-def _graph():
+def _tracked_graph():
     nodes, links = [], []
     for ch, azimuth, elevation in SPEAKERS:
         nodes.append(f'{{ type = builtin label = copy name = in{ch} }}')
@@ -102,10 +108,90 @@ def _graph():
         links.append(f'{{ output = "inLFE:Out" input = "out{side}:In 3" }}')
         links.append(f'{{ output = "room{side}:Out" input = "out{side}:In 4" }}')
 
-    port_of = {ch: f'"in{ch}:In"' for ch in CHANNELS}
-    inputs = ' '.join(port_of[ch] for ch in CHANNELS)
-    return ('nodes = [\n' + '\n'.join(nodes) + '\n]\nlinks = [\n' + '\n'.join(links) +
-            f'\n]\ninputs = [ {inputs} ]\noutputs = [ "outL:Out" "outR:Out" ]')
+    return _assemble(nodes, links)
+
+
+def _assemble(nodes, links):
+    """Graph text for a renderer whose binaural mix ends at outL/outR, followed by the peak limiter."""
+    limiter_nodes, limiter_links = _limiter()
+    inputs = ' '.join(f'"in{ch}:In"' for ch in CHANNELS)
+    return ('nodes = [\n' + '\n'.join(nodes + limiter_nodes) + '\n]\nlinks = [\n' + '\n'.join(links + limiter_links) +
+            f'\n]\ninputs = [ {inputs} ]\noutputs = [ "safeL:Out" "safeR:Out" ]')
+
+
+def _limiter():
+    """Look-ahead peak limiter on the binaural pair, so that matching the loudness of direct playback cannot clip.
+
+    The stereo-linked peak is held over LIMITER_WINDOW_SECONDS (taps spread so any tone frequency is sampled at many
+    phases), turned into a gain that keeps it under LIMITER_CEILING and smoothed by a critically damped low-pass that
+    settles within the same time. The audio is delayed by exactly one window: the gain has settled when a peak arrives
+    (attack) and only starts to recover once the last loud sample has left (release). A final clamp guarantees the
+    ceiling.
+    """
+    nodes, links = [], []
+    # max-delay must exceed the longest delay: a delay equal to max-delay passes the signal through undelayed
+    delay = lambda name, seconds: nodes.append(
+        f'{{ type = builtin label = delay name = {name} config = {{ "max-delay" = {4 * LIMITER_WINDOW_SECONDS} }} '
+        f'control = {{ "Delay (s)" = {seconds!r} }} }}')
+    for side in 'LR':
+        nodes.append(f'{{ type = builtin label = abs name = abs{side} }}')
+        links.append(f'{{ output = "out{side}:Out" input = "abs{side}:In" }}')
+    nodes.append('{ type = builtin label = max name = peak }')
+    links += ['{ output = "absL:Out" input = "peak:In 1" }', '{ output = "absR:Out" input = "peak:In 2" }']
+    # The hold must see every phase of any tone: evenly spaced taps would sample a 1 kHz tone at only a few phases and
+    # leave a ripple that the smoothing averages away. Golden-ratio offsets cover the window evenly for any frequency.
+    offsets = [0.0] + [LIMITER_WINDOW_SECONDS * ((k * 0.6180339887498949) % 1.0) for k in range(1, LIMITER_TAPS - 1)]
+    offsets.append(LIMITER_WINDOW_SECONDS)
+    # `max` has 8 inputs: the taps are folded through a two-level tree
+    groups = [range(i, min(i + 8, LIMITER_TAPS)) for i in range(0, LIMITER_TAPS, 8)]
+    nodes.append('{ type = builtin label = max name = hold }')
+    for g, taps in enumerate(groups):
+        nodes.append(f'{{ type = builtin label = max name = hold{g} }}')
+        links.append(f'{{ output = "hold{g}:Out" input = "hold:In {g + 1}" }}')
+        for slot, k in enumerate(taps, 1):
+            if k == 0:
+                links.append(f'{{ output = "peak:Out" input = "hold{g}:In {slot}" }}')
+                continue
+            delay(f'tap{k}', offsets[k])
+            links += [f'{{ output = "peak:Out" input = "tap{k}:In" }}', f'{{ output = "tap{k}:Out" input = "hold{g}:In {slot}" }}']
+    nodes.append(f'{{ type = builtin label = linear name = overshoot control = {{ "Mult" = {1 / LIMITER_CEILING!r} "Add" = 0.0 }} }}')
+    nodes.append('{ type = builtin label = clamp name = overshootOnly control = { "Min" = 1.0 "Max" = 1000.0 } }')
+    nodes.append('{ type = builtin label = recip name = reduction }')
+    f0 = LIMITER_SETTLE_FACTOR / (2 * math.pi * LIMITER_WINDOW_SECONDS)
+    nodes.append(f'{{ type = builtin label = bq_lowpass name = reductionSmooth control = {{ "Freq" = {f0!r} "Q" = 0.5 "Gain" = 0.0 }} }}')
+    links += ['{ output = "hold:Out" input = "overshoot:In" }', '{ output = "overshoot:Out" input = "overshootOnly:In" }',
+              '{ output = "overshootOnly:Out" input = "reduction:In" }', '{ output = "reduction:Out" input = "reductionSmooth:In" }']
+    for side in 'LR':
+        delay(f'ahead{side}', LIMITER_WINDOW_SECONDS)
+        nodes.append(f'{{ type = builtin label = mult name = limited{side} }}')
+        nodes.append(f'{{ type = builtin label = clamp name = safe{side} control = {{ "Min" = -1.0 "Max" = 1.0 }} }}')
+        links += [f'{{ output = "out{side}:Out" input = "ahead{side}:In" }}',
+                  f'{{ output = "ahead{side}:Out" input = "limited{side}:In 1" }}',
+                  '{ output = "reductionSmooth:Out" input = "limited' + side + ':In 2" }',
+                  f'{{ output = "limited{side}:Out" input = "safe{side}:In" }}']
+    return nodes, links
+
+
+def _fixed_graph():
+    """Apple's captured rendering of each virtual speaker, played back as is: one convolver per speaker and ear."""
+    nodes, links = [], []
+    gains = ' '.join(f'"Gain {i}" = {FIXED_GAIN}' for i in range(1, len(SPEAKERS) + 1))
+    for side, offset in (('L', 0), ('R', 1)):
+        nodes.append(f'{{ type = builtin label = mixer name = out{side} control = {{ {gains} '
+                     f'"Gain {len(SPEAKERS) + 1}" = {FIXED_GAIN * LFE_GAIN} }} }}')
+        for i, (ch, _, _) in enumerate(SPEAKERS):
+            nodes.append(f'{{ type = builtin label = convolver name = brir{ch}{side} '
+                         f'config = {{ filename = "{BRIR}" channel = {2 * i + offset} }} }}')
+            links.append(f'{{ output = "in{ch}:Out" input = "brir{ch}{side}:In" }}')
+            links.append(f'{{ output = "brir{ch}{side}:Out" input = "out{side}:In {i + 1}" }}')
+        links.append(f'{{ output = "inLFE:Out" input = "out{side}:In {len(SPEAKERS) + 1}" }}')
+    nodes += [f'{{ type = builtin label = copy name = in{ch} }}' for ch, _, _ in SPEAKERS]
+    nodes.append('{ type = builtin label = copy name = inLFE }')
+    return _assemble(nodes, links)
+
+
+def _graph(tracked):
+    return _tracked_graph() if tracked else _fixed_graph()
 
 
 CONF = """context.properties = {{ log.level = 0 }}
@@ -172,6 +258,11 @@ def airpods_sink(address):
     return None
 
 
+def _alpha(cutoff_hz, dt):
+    """Smoothing factor of a first-order low-pass with the given cutoff, for samples dt seconds apart."""
+    return 1.0 / (1.0 + 1.0 / (2.0 * math.pi * cutoff_hz * dt))
+
+
 def _mul(a, b):
     w1, x1, y1, z1 = a
     w2, x2, y2, z2 = b
@@ -179,33 +270,6 @@ def _mul(a, b):
             w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
             w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
             w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2)
-
-
-class SpeedAdaptiveFilter:
-    """One-euro low-pass: the cutoff rises with the signal's speed. `wrap` filters an angle in degrees."""
-
-    def __init__(self, wrap=False):
-        self.wrap = wrap
-        self.value = None
-        self.speed = 0.0
-
-    @staticmethod
-    def _alpha(dt, cutoff_hz):
-        return 1.0 / (1.0 + 1.0 / (2.0 * math.pi * cutoff_hz * dt))
-
-    def __call__(self, x, dt):
-        dt = max(dt, 1e-3)
-        if self.value is None:
-            self.value = x
-            return x
-        diff = x - self.value
-        if self.wrap:
-            diff = (diff + 180.0) % 360.0 - 180.0
-        self.speed += self._alpha(dt, FILTER_SPEED_CUTOFF_HZ) * (abs(diff) / dt - self.speed)
-        self.value += self._alpha(dt, FILTER_MIN_CUTOFF_HZ + FILTER_SPEED_GAIN * self.speed) * diff
-        if self.wrap:
-            self.value = (self.value + 180.0) % 360.0 - 180.0
-        return self.value
 
 
 class HeadPose:
@@ -220,8 +284,9 @@ class HeadPose:
         self.last_time = 0.0
         self.still_time = 0.0
         self.last_raw = (0.0, 0.0)
-        self.yaw_filter = SpeedAdaptiveFilter(wrap=True)
-        self.pitch_filter = SpeedAdaptiveFilter()
+        self.smooth_yaw = 0.0
+        self.smooth_pitch = 0.0
+        self.speed = 0.0
 
     def update(self, vector):
         now = time.monotonic()
@@ -271,9 +336,14 @@ class HeadPose:
         else:
             self.still_time = 0.0
 
-        # Speed-adaptive low-pass: heavy smoothing while the head is still (sensor jitter never reaches the
-        # renderer), light smoothing while it turns (no lag)
-        return self.yaw_filter(yaw, dt), self.pitch_filter(pitch, dt)
+        # One-euro filter on the wrapped difference, so turning past +-180 degrees does not swing round
+        yaw_step = (yaw - self.smooth_yaw + 180.0) % 360.0 - 180.0
+        pitch_step = pitch - self.smooth_pitch
+        self.speed += _alpha(FILTER_SPEED_CUTOFF_HZ, dt) * (math.hypot(yaw_step, pitch_step) / dt - self.speed)
+        alpha = _alpha(FILTER_MIN_CUTOFF_HZ + FILTER_SPEED_GAIN * self.speed, dt)
+        self.smooth_yaw = (self.smooth_yaw + alpha * yaw_step + 180.0) % 360.0 - 180.0
+        self.smooth_pitch += alpha * pitch_step
+        return self.smooth_yaw, self.smooth_pitch
 
 
 class Spatializer:
@@ -283,6 +353,7 @@ class Spatializer:
         self.control = None
         self.node_id = None
         self.target = None
+        self.tracked = False
         self.attempts = 0
         self.reset_steering()
 
@@ -296,14 +367,14 @@ class Spatializer:
     def active(self):
         return self.control is not None
 
-    def start(self, target, description):
-        if self.engine and self.target == target:
+    def start(self, target, description, tracked):
+        if self.engine and (self.target, self.tracked) == (target, tracked):
             return
         self.stop()
-        self.target = target
+        self.target, self.tracked = target, tracked
         path = os.path.join(GLib.get_user_runtime_dir(), 'airpods-spatial.conf')
         with open(path, 'w') as f:
-            f.write(CONF.format(description=description, graph=_graph(), sink=SINK_NAME, target=target,
+            f.write(CONF.format(description=description, graph=_graph(tracked), sink=SINK_NAME, target=target,
                                 channels=len(CHANNELS), positions=' '.join(CHANNELS), quantum=QUANTUM, rate=RATE))
         self.engine = subprocess.Popen(['pipewire', '-c', path],
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -342,13 +413,14 @@ class Spatializer:
         if self.switching:
             GLib.source_remove(self.switching)
         self.engine = self.control = self.node_id = self.target = None
+        self.tracked = False
         self.reset_steering()
         if was_active:
             self.on_change()
 
     def steer(self, yaw, pitch):
         """Render the virtual speakers for a head pose; poses arriving mid-switch coalesce into the next switch."""
-        if not self.control:
+        if not self.control or not self.tracked:
             return
         if self.switching:
             self.pending = (yaw, pitch)
@@ -382,11 +454,6 @@ class Spatializer:
             return False
 
     def _switched(self):
-        # Cooldown: bank switches are rate-limited so continuous motion cannot modulate the sound
-        self.switching = GLib.timeout_add(math.ceil(SWITCH_COOLDOWN_SECONDS * 1000), self._ready)
-        return False
-
-    def _ready(self):
         self.switching = None
         if self.pending:
             pose, self.pending = self.pending, None

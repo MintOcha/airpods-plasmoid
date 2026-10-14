@@ -32,7 +32,7 @@ def thirds_db(x):
 
 def response(sink, active):
     """Binaural impulse response of the renderer for the given input channels driven together."""
-    sw, inv = measure.sweep()
+    sw, inv = measure.sweep(level=0.1)   # low enough that the output limiter never acts: the response is level-independent
     frames = np.zeros((len(sw), len(CHANNELS)), np.float32)
     for ch in active:
         frames[:, CHANNELS.index(ch)] = sw

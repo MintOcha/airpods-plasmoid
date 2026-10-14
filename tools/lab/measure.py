@@ -106,11 +106,11 @@ def stop_engines():
     time.sleep(0.5)
 
 
-def load_spatial():
+def load_spatial(tracked=False):
     import spatial
     importlib.reload(spatial)
     sp = spatial.Spatializer(lambda: None)
-    sp.start(TARGET, 'AirPods Spatial (lab)')
+    sp.start(TARGET, 'AirPods Spatial (lab)', tracked)
     context = GLib.MainContext.default()
     deadline = time.monotonic() + 20
     while not sp.active and sp.engine and time.monotonic() < deadline:
@@ -173,7 +173,7 @@ def run(args):
     os.makedirs(OUT, exist_ok=True)
     only = set(args.only.split(','))
     report = {}
-    module, sp = load_spatial() if args.sink == 'spatial' else (None, None)
+    module, sp = load_spatial(tracked=True) if args.sink == 'spatial' else (None, None)
     sink = module.SINK_NAME if sp else TARGET
     try:
         if 'sweep' in only:

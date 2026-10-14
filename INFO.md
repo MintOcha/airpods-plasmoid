@@ -17,8 +17,9 @@ contents/
 │   ├── controls.py   settings catalog shown in the widget
 │   ├── media.py      ear-detection pause, conversation ducking
 │   ├── spatial.py    PipeWire HRTF spatializer + head tracking
-│   ├── binaural/     HRTF set and virtual room used by spatial.py (built by tools/build_binaural.py)
-│   └── setup.sh      installs/starts airpods-plugin.service
+│   ├── binaural/     brir.wav (Apple's captured rendering, fixed mode), hrtf.sofa + room.wav (head tracking); built by tools/build_binaural.py
+│   ├── wireplumber/  Bluetooth codec policy (AAC variable bitrate, SBC-XQ fallback), installed by setup.sh
+│   └── setup.sh      installs/starts airpods-plugin.service and the codec policy
 └── icons/
 tools/                not packaged
 ├── apple_reference.py   measures Apple's renderer from captures -> spatial_targets.json
@@ -40,8 +41,9 @@ journalctl --user -u airpods-plugin -f
 
 ```bash
 python3 tools/apple_reference.py dry.wav brir.wav     # only when re-measuring Apple's renderer
-python3 tools/build_binaural.py HRIR_FULL2DEG.sofa     # full rebuild (~4 min)
-python3 tools/build_binaural.py --room-only            # room only, from the built HRTF
+python3 tools/build_binaural.py HRIR_FULL2DEG.sofa dry.wav brir.wav   # full rebuild (~4 min), incl. brir.wav
+python3 tools/build_binaural.py --room-only dry.wav brir.wav          # room + brir.wav, from the built HRTF
+python3 tools/build_binaural.py --exact-only dry.wav brir.wav         # brir.wav only
 ```
 
 Verify any change in the lab container (`tools/lab/README.md`) before shipping.

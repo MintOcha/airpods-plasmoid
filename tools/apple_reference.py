@@ -2,7 +2,7 @@
 
 Inputs are HeSuVi 7-channel captures of Apple's "Spatialize Stereo" output (posted on the HeSuVi forum):
 a dry HRIR set and a reverberant BRIR set. Only measurements are written out (spatial_targets.json);
-the captured audio itself is not redistributed.
+build_binaural.py separately trims the BRIR capture into the fixed-mode renderer's brir.wav.
 
 The posted BRIR files do not agree on which column holds which speaker, so BRIR columns are assigned to the dry
 set's speakers by matching each (ipsilateral, contralateral) pair's direct sound.

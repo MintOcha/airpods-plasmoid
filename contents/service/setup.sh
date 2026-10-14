@@ -23,6 +23,16 @@ RestartSec=3
 WantedBy=graphical-session.target
 EOF
 
+# Bluetooth codec policy: AAC at its highest variable-bitrate quality, SBC-XQ as fallback. WirePlumber only reads it
+# at startup and the codec is negotiated per connection, so restart it only when the file changed.
+WP_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/wireplumber/wireplumber.conf.d"
+WP_CONF="51-airpods-codec.conf"
+mkdir -p "$WP_DIR"
+if ! cmp -s "$(dirname "$DAEMON")/wireplumber/$WP_CONF" "$WP_DIR/$WP_CONF"; then
+    cp "$(dirname "$DAEMON")/wireplumber/$WP_CONF" "$WP_DIR/$WP_CONF"
+    systemctl --user try-restart wireplumber.service || true
+fi
+
 systemctl --user daemon-reload
 systemctl --user enable "$SERVICE"
 systemctl --user restart "$SERVICE"

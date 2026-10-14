@@ -294,7 +294,7 @@ class Service(dbus.service.Object):
         if mode == 'off' or not self.sink:
             self.spatial.stop()
         else:
-            self.spatial.start(self.sink, f"{self.device['name']} (Spatial Audio)")
+            self.spatial.start(self.sink, f"{self.device['name']} (Spatial Audio)", tracked=mode == 'head')
         want_tracking = mode == 'head' and self.session is not None
         if want_tracking != self.tracking and self.session:
             self.session.send(aap.HEAD_TRACKING_START if want_tracking else aap.HEAD_TRACKING_STOP)

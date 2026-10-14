@@ -4,3 +4,9 @@ license. Changes: subset of the 2-degree Gauss grid, minimum phase with a freque
 delay, magnitudes matched to measurements of Apple's generic Spatial Audio rendering.
 
 room.wav: synthesized by tools/build_binaural.py.
+
+brir.wav: the HeSuVi forum community capture of Apple's generic Spatial Audio rendering (AppleSpatialAudio+, posted
+by "3 DJ" in the "Apple Spatial Audio" thread), trimmed by a common lead-in and reordered per virtual speaker. The
+capture carries no license, and the rendering it records is Apple's. It is included so fixed mode reproduces that
+rendering exactly; confirm you may redistribute it before publishing a package (e.g. to the KDE Store). Without it,
+build the other assets only (hrtf.sofa, room.wav) and fixed mode needs a different source.

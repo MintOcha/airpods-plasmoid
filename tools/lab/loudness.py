@@ -6,6 +6,8 @@
 Usage (inside the lab container): python3 loudness.py
 """
 
+import sys
+
 import numpy as np
 from scipy import signal
 
@@ -48,9 +50,9 @@ def level(sink, frames, name):
     return lufs(rec), 20 * np.log10(np.max(np.abs(rec)) + 1e-12)
 
 
-def main():
+def main(tracked=False):
     measure.stop_engines()
-    module, sp = measure.load_spatial()
+    module, sp = measure.load_spatial(tracked)
     try:
         cases = [(f'pink, correlation {c}', stereo_pink(c)) for c in (1.0, 0.6, 0.0)]
         cases.append(('0 dBFS bass-heavy mix', music_like()))
@@ -65,4 +67,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    main(tracked='--tracked' in sys.argv)

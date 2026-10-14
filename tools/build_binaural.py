@@ -12,6 +12,8 @@ levelled so the total (direct + room) band energy at each ear matches Apple's ca
 
 Usage: python3 tools/build_binaural.py <HRIR_FULL2DEG.sofa>
        python3 tools/build_binaural.py --room-only     (re-derive the room from the built HRTF)
+       python3 tools/build_binaural.py <HRIR_FULL2DEG.sofa|--room-only|--exact-only> <dry.wav> <brir.wav>
+                                                       (also writes brir.wav: Apple's captured rendering itself)
 """
 
 import json
@@ -29,6 +31,7 @@ TARGETS = os.path.join(ROOT, 'tools', 'spatial_targets.json')
 OUT_DIR = os.path.join(ROOT, 'contents', 'service', 'binaural')
 sys.path.insert(0, os.path.join(ROOT, 'contents', 'service'))
 from spatial import SPEAKERS, RATE  # noqa: E402
+import apple_reference as ar  # noqa: E402
 
 TAPS = 160
 NFFT = 4096
@@ -305,13 +308,45 @@ def write_hrtf(pos, hrtf):
     sofar.write_sofa(os.path.join(OUT_DIR, 'hrtf.sofa'), sofa, compression=9)
 
 
-def main(source):
+def speaker_channels(columns):
+    """room.wav / brir.wav layout: left-ear then right-ear response per virtual speaker, in SPEAKERS order.
+
+    `columns` maps a speaker's azimuth magnitude to its (ipsilateral, contralateral) responses. Right-side speakers
+    get the mirror image of their left counterpart, as in a symmetric room.
+    """
+    channels = []
+    for _, azimuth, _ in SPEAKERS:
+        ipsi, contra = columns[abs(azimuth)]
+        channels += [contra, ipsi] if azimuth < 0 else [ipsi, contra]
+    return np.array(channels, np.float32).T
+
+
+def exact_brir(dry_path, brir_path):
+    """Apple's captured virtual-speaker rendering itself (direct sound and room), for the fixed-pose renderer.
+
+    The capture's lead-in is trimmed by one common amount so interaural delays are kept.
+    """
+    _, dry = ar.load(dry_path)
+    _, brir = ar.load(brir_path)
+    layout = ar.brir_layout(dry, brir)
+    used = {abs(a): (i, c) for _, (a, i, c) in layout.items()}
+    lead = max(0, min(ar.onset(brir[:, k]) for pair in used.values() for k in pair) - 32)
+    columns = {a: (brir[lead:, i], brir[lead:, c]) for a, (i, c) in used.items()}
+    wavfile.write(os.path.join(OUT_DIR, 'brir.wav'), RATE, speaker_channels(columns))
+    print(f'brir.wav: {len(brir) - lead} samples, lead-in {lead} trimmed')
+
+
+def main(source, *captures):
     with open(TARGETS) as f:
         targets = json.load(f)
     os.makedirs(OUT_DIR, exist_ok=True)
+    if captures:
+        exact_brir(*captures)
     if source == '--room-only':
         built = h5py.File(os.path.join(OUT_DIR, 'hrtf.sofa'), 'r')
         pos, hrtf = built['SourcePosition'][:], built['Data.IR'][:]
+    elif source == '--exact-only':
+        return
     else:
         pos, irs, _ = load_hrtf(source)
         hrtf = morph(pos, irs, targets)
@@ -329,13 +364,9 @@ def main(source):
             room = dict(room, bands=[dict(b, coherence=fb['coherence']) for b, fb in
                                      zip(room['bands'], directions[30.0]['room']['bands'])])
         tails[azimuth] = room_tail((hrtf[m, 0], hrtf[m, 1]), room, targets['low_thirds'], seed=int(azimuth))
-    channels = []
-    for ch, azimuth, elevation in SPEAKERS:
-        ipsi, contra = tails[abs(azimuth)]
-        channels += [contra, ipsi] if azimuth < 0 else [ipsi, contra]
-    wavfile.write(os.path.join(OUT_DIR, 'room.wav'), RATE, np.array(channels, np.float32).T)
-    print(f'{len(pos)} directions, room {len(channels)} channels')
+    wavfile.write(os.path.join(OUT_DIR, 'room.wav'), RATE, speaker_channels(tails))
+    print(f'{len(pos)} directions, room {2 * len(SPEAKERS)} channels')
 
 
 if __name__ == '__main__':
-    main(sys.argv[1])
+    main(*sys.argv[1:])
