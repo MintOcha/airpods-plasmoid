@@ -51,7 +51,7 @@ context.modules = [
     {{ name = libpipewire-module-adapter }}
     {{ name = libpipewire-module-filter-chain
         args = {{
-            node.description = "{description}"
+            node.description = {description}
             filter.graph = {{
 {graph}
             }}
@@ -70,7 +70,7 @@ context.modules = [
                 node.name = "{sink}.output"
                 node.passive = true
                 node.dont-fallback = true
-                target.object = "{target}"
+                target.object = {target}
                 audio.channels = 2
                 audio.position = [ FL FR ]
             }}
@@ -169,7 +169,7 @@ class Spatializer:
         self.target = target
         path = os.path.join(GLib.get_user_runtime_dir(), 'airpods-spatial.conf')
         with open(path, 'w') as f:
-            f.write(CONF.format(description=description, graph=_graph(), sink=SINK_NAME, target=target,
+            f.write(CONF.format(description=json.dumps(description), graph=_graph(), sink=SINK_NAME, target=json.dumps(target),
                                 channels=len(SPEAKERS), positions=' '.join(SPEAKERS)))
         self.engine = subprocess.Popen(['pipewire', '-c', path],
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
