@@ -44,10 +44,13 @@ FADE_POLE = math.exp(-12.0 / (FADE_SECONDS * RATE))
 
 # Head tracking constants
 RECENTER_SECONDS = 12.0
-UPDATE_THRESHOLD = 0.5   # degrees of head motion worth re-rendering
+UPDATE_THRESHOLD = 1.0   # degrees of head motion worth re-rendering
+SWITCH_COOLDOWN_SECONDS = 0.08
 ATTACH_ATTEMPTS = 40
 STREAM_GAP_SECONDS = 0.5
-SMOOTH_FACTOR = 0.35     # 1st-order low-pass filter factor
+FILTER_MIN_CUTOFF_HZ = 0.8     # smoothing cutoff while the head is still
+FILTER_SPEED_GAIN = 0.03       # extra cutoff Hz per degree/second of head speed
+FILTER_SPEED_CUTOFF_HZ = 1.0   # smoothing of the speed estimate itself
 
 
 def _graph():
@@ -178,6 +181,33 @@ def _mul(a, b):
             w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2)
 
 
+class SpeedAdaptiveFilter:
+    """One-euro low-pass: the cutoff rises with the signal's speed. `wrap` filters an angle in degrees."""
+
+    def __init__(self, wrap=False):
+        self.wrap = wrap
+        self.value = None
+        self.speed = 0.0
+
+    @staticmethod
+    def _alpha(dt, cutoff_hz):
+        return 1.0 / (1.0 + 1.0 / (2.0 * math.pi * cutoff_hz * dt))
+
+    def __call__(self, x, dt):
+        dt = max(dt, 1e-3)
+        if self.value is None:
+            self.value = x
+            return x
+        diff = x - self.value
+        if self.wrap:
+            diff = (diff + 180.0) % 360.0 - 180.0
+        self.speed += self._alpha(dt, FILTER_SPEED_CUTOFF_HZ) * (abs(diff) / dt - self.speed)
+        self.value += self._alpha(dt, FILTER_MIN_CUTOFF_HZ + FILTER_SPEED_GAIN * self.speed) * diff
+        if self.wrap:
+            self.value = (self.value + 180.0) % 360.0 - 180.0
+        return self.value
+
+
 class HeadPose:
     """Yaw/pitch tracking from AirPods quaternions with motion-aware stabilization."""
 
@@ -190,8 +220,8 @@ class HeadPose:
         self.last_time = 0.0
         self.still_time = 0.0
         self.last_raw = (0.0, 0.0)
-        self.smooth_yaw = 0.0
-        self.smooth_pitch = 0.0
+        self.yaw_filter = SpeedAdaptiveFilter(wrap=True)
+        self.pitch_filter = SpeedAdaptiveFilter()
 
     def update(self, vector):
         now = time.monotonic()
@@ -241,11 +271,9 @@ class HeadPose:
         else:
             self.still_time = 0.0
 
-        # Exponential low-pass on the wrapped difference, so turning past +-180 degrees does not swing round
-        self.smooth_yaw += SMOOTH_FACTOR * ((yaw - self.smooth_yaw + 180.0) % 360.0 - 180.0)
-        self.smooth_yaw = (self.smooth_yaw + 180.0) % 360.0 - 180.0
-        self.smooth_pitch += SMOOTH_FACTOR * (pitch - self.smooth_pitch)
-        return self.smooth_yaw, self.smooth_pitch
+        # Speed-adaptive low-pass: heavy smoothing while the head is still (sensor jitter never reaches the
+        # renderer), light smoothing while it turns (no lag)
+        return self.yaw_filter(yaw, dt), self.pitch_filter(pitch, dt)
 
 
 class Spatializer:
@@ -354,6 +382,11 @@ class Spatializer:
             return False
 
     def _switched(self):
+        # Cooldown: bank switches are rate-limited so continuous motion cannot modulate the sound
+        self.switching = GLib.timeout_add(math.ceil(SWITCH_COOLDOWN_SECONDS * 1000), self._ready)
+        return False
+
+    def _ready(self):
         self.switching = None
         if self.pending:
             pose, self.pending = self.pending, None
