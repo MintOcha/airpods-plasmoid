@@ -352,11 +352,15 @@ class Service(dbus.service.Object):
 
     @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature='ss', out_signature='v')
     def Get(self, iface, prop):
-        return self.GetAll(iface)[prop]
+        # Never raise KeyError on an unexpected iface/prop: a thrown D-Bus error
+        # reply crashes the KDE QML dbus decoder (Decoder::dbusToVariant, NULL deref).
+        return self.GetAll(iface).get(prop, json.dumps(self.state()))
 
     @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature='s', out_signature='a{sv}')
     def GetAll(self, iface):
-        return {'State': json.dumps(self.state())} if iface == IFACE else {}
+        # Always return the State property, even for an empty/foreign iface, so the
+        # client never receives an empty variant the decoder can't handle.
+        return {'State': json.dumps(self.state())}
 
     @dbus.service.signal(dbus.PROPERTIES_IFACE, signature='sa{sv}as')
     def PropertiesChanged(self, iface, changed, invalidated):

@@ -56,8 +56,8 @@ PlasmoidItem {
         service: root.service
         path: root.objectPath
         iface: root.service
-        onRefreshed: root.load(properties.State)
-        onPropertiesChanged: (iface, changed) => { if (changed.State !== undefined) root.load(changed.State) }
+        onRefreshed: root.load(properties?.State ?? null)
+        onPropertiesChanged: (iface, changed) => { if (changed?.State !== undefined) root.load(changed.State) }
     }
 
     function load(json) {
